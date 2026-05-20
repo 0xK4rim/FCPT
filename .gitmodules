@@ -1,0 +1,3 @@
+[submodule "FCPT.nvim"]
+	path = FCPT.nvim
+	url = git@github.com:0xK4rim/FCPT.nvim
