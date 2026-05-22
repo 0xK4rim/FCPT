@@ -73,10 +73,10 @@
     if (!root) return [];
 
     const inputs = [...root.querySelectorAll(".input pre")].map((pre) =>
-      normalizeText(pre.textContent)
+      normalizeText(pre.innerText)
     );
     const outputs = [...root.querySelectorAll(".output pre")].map((pre) =>
-      normalizeText(pre.textContent)
+      normalizeText(pre.innerText)
     );
 
     const n = Math.max(inputs.length, outputs.length);
