@@ -20,13 +20,11 @@
   };
 
   function normalizeText(text) {
-    return (text || "").replace(/\r\n/g, "\n").trimEnd();
-  }
-
-  function isVisible(el) {
-    if (!el) return false;
-    const style = getComputedStyle(el);
-    return style.display !== "none" && style.visibility !== "hidden";
+    return String(text ?? "")
+      .replace(/\r\n/g, "\n")
+      .replace(/\r/g, "\n")
+      .replace(/\u00a0/g, " ")
+      .trimEnd();
   }
 
   function buildClipboardText(samples) {
@@ -63,59 +61,269 @@
         text,
       });
       return !!(result && result.ok);
-    } catch (_) {
+    } catch (err) {
+      console.error("[Sample Copier] Save failed:", err);
       return false;
     }
   }
 
-  function getCodeforcesSamples() {
+  function readSampleElement(el) {
+    if (!el) return "";
+
+    const pre = el.matches?.("pre") ? el : el.querySelector?.("pre");
+    const target = pre || el;
+
+    // innerText preserves the rendered line breaks used by the statement.
+    // Fall back to textContent for elements where innerText is unavailable.
+    const text = typeof target.innerText === "string"
+      ? target.innerText
+      : target.textContent;
+
+    return normalizeText(text);
+  }
+
+  function isNonEmptySample(input, output) {
+    return input.length > 0 || output.length > 0;
+  }
+
+  function dedupeSamples(samples) {
+    const seen = new Set();
+    const result = [];
+
+    for (const sample of samples) {
+      const input = normalizeText(sample.input);
+      const output = normalizeText(sample.output);
+      if (!isNonEmptySample(input, output)) continue;
+
+      const key = `${input}\0${output}`;
+      if (seen.has(key)) continue;
+
+      seen.add(key);
+      result.push({ input, output });
+    }
+
+    return result;
+  }
+
+  // Standard Codeforces layout:
+  // .sample-test > .input/.output > pre
+  function getStandardCodeforcesSamples() {
     const root = document.querySelector(".sample-test");
     if (!root) return [];
 
-    const inputs = [...root.querySelectorAll(".input pre")].map((pre) =>
-      normalizeText(pre.innerText)
-    );
-    const outputs = [...root.querySelectorAll(".output pre")].map((pre) =>
-      normalizeText(pre.innerText)
-    );
+    const inputs = [...root.querySelectorAll(".input pre")]
+      .map(readSampleElement);
+    const outputs = [...root.querySelectorAll(".output pre")]
+      .map(readSampleElement);
 
-    const n = Math.max(inputs.length, outputs.length);
     const samples = [];
-    for (let i = 0; i < n; i++) {
-      const input = inputs[i] ?? "";
-      const output = outputs[i] ?? "";
-      if (input || output) samples.push({ input, output });
+    const count = Math.max(inputs.length, outputs.length);
+
+    for (let i = 0; i < count; i++) {
+      samples.push({
+        input: inputs[i] ?? "",
+        output: outputs[i] ?? "",
+      });
     }
-    return samples;
+
+    return dedupeSamples(samples);
   }
 
-  function getAtCoderSamples() {
-    const root = document.querySelector("#task-statement span.lang-en");
-    if (!root) return [];
-
-    const parts = [...root.querySelectorAll("div.part")];
-    const sampleParts = parts.slice(2);
-
+  // Some statements render examples as a two-column HTML table:
+  // | standard input | standard output |
+  // | <pre>...</pre> | <pre>...</pre> |
+  function getTableSamples() {
     const samples = [];
-    for (let i = 2; i + 1 < sampleParts.length; i += 2) {
-      const inputPre = sampleParts[i].querySelector("pre");
-      const outputPre = sampleParts[i + 1].querySelector("pre");
 
-      const input = normalizeText(inputPre ? inputPre.textContent : "");
-      const output = normalizeText(outputPre ? outputPre.textContent : "");
+    function classifyHeader(text) {
+      const value = normalizeText(text)
+        .replace(/\s+/g, " ")
+        .replace(/:$/, "")
+        .trim()
+        .toLowerCase();
 
-      if (input || output) {
-        samples.push({ input, output });
+      if (/^(?:(?:sample|standard|example)\s+)?input(?:\s+(?:file|#?\d+))?$/.test(value)) {
+        return "input";
+      }
+
+      if (/^(?:(?:sample|standard|example)\s+)?output(?:\s+(?:file|#?\d+))?$/.test(value)) {
+        return "output";
+      }
+
+      return null;
+    }
+
+    for (const table of document.querySelectorAll(".problem-statement table, table")) {
+      const rows = [...table.querySelectorAll("tr")];
+
+      for (let headerRowIndex = 0; headerRowIndex < rows.length; headerRowIndex++) {
+        const headerCells = [...rows[headerRowIndex].cells];
+        let inputIndex = -1;
+        let outputIndex = -1;
+
+        headerCells.forEach((cell, index) => {
+          const kind = classifyHeader(cell.textContent);
+          if (kind === "input") inputIndex = index;
+          if (kind === "output") outputIndex = index;
+        });
+
+        if (inputIndex === -1 || outputIndex === -1) continue;
+
+        for (const row of rows.slice(headerRowIndex + 1)) {
+          const cells = [...row.cells];
+          if (cells.length <= Math.max(inputIndex, outputIndex)) continue;
+
+          samples.push({
+            input: readSampleElement(cells[inputIndex]),
+            output: readSampleElement(cells[outputIndex]),
+          });
+        }
+
+        // A table normally contains only one examples table/header pair.
+        break;
       }
     }
 
-    return samples;
+    return dedupeSamples(samples);
   }
 
-  function getSamples() {
-    if (document.querySelector(".sample-test")) return getCodeforcesSamples();
-    if (document.querySelector("#task-statement")) return getAtCoderSamples();
+  // Alternate layouts use .sample, .example, or related wrappers
+  // around separate .input and .output blocks.
+  function getContainerSamples() {
+    const samples = [];
+    const rootSelector = [
+      ".sample-tests",
+      ".sample-test",
+      ".samples",
+      ".sample",
+      ".examples",
+      ".example",
+      ".sample-case",
+      ".test-example",
+      "[data-sample]"
+    ].join(",");
+
+    for (const root of document.querySelectorAll(rootSelector)) {
+      const inputs = [
+        ...root.querySelectorAll(
+          ".input, .sample-input, .example-input, [data-sample-input]"
+        )
+      ];
+      const outputs = [
+        ...root.querySelectorAll(
+          ".output, .sample-output, .example-output, [data-sample-output]"
+        )
+      ];
+
+      const count = Math.max(inputs.length, outputs.length);
+
+      for (let i = 0; i < count; i++) {
+        samples.push({
+          input: readSampleElement(inputs[i]),
+          output: readSampleElement(outputs[i]),
+        });
+      }
+    }
+
+    return dedupeSamples(samples);
+  }
+
+  // Last-resort fallback for statement templates that use the input/output
+  // block classes but omit a recognizable sample wrapper.
+  function getLooseClassSamples() {
+    const inputs = [
+      ...document.querySelectorAll(
+        ".input:not(.input-specification), .sample-input, " +
+        ".example-input, [data-sample-input]"
+      )
+    ];
+    const outputs = [
+      ...document.querySelectorAll(
+        ".output:not(.output-specification), .sample-output, " +
+        ".example-output, [data-sample-output]"
+      )
+    ];
+
+    const samples = [];
+    const count = Math.max(inputs.length, outputs.length);
+
+    for (let i = 0; i < count; i++) {
+      samples.push({
+        input: readSampleElement(inputs[i]),
+        output: readSampleElement(outputs[i]),
+      });
+    }
+
+    return dedupeSamples(samples);
+  }
+
+  function getCodeforcesSamples() {
+    const extractors = [
+      getStandardCodeforcesSamples,
+      getTableSamples,
+      getContainerSamples,
+      getLooseClassSamples,
+    ];
+
+    for (const extract of extractors) {
+      const samples = extract();
+      if (samples.length) return samples;
+    }
+
     return [];
+  }
+
+
+  function getAtCoderSamples() {
+    const task = document.querySelector("#task-statement");
+    if (!task) return [];
+
+    // Select the currently visible statement language.
+    const languages = [
+      ...task.querySelectorAll("span.lang-en, span.lang-ja")
+    ];
+
+    const root =
+      languages.find(el => el.getClientRects().length > 0) ||
+      task;
+    
+    const elements = [
+      ...root.querySelectorAll('pre[id^="pre-sample"]')
+    ];
+
+    const sampleMap = new Map();
+
+    for (const pre of elements) {
+      const match = pre.id.match(/^pre-sample(\d+)$/);
+      if (!match) continue;
+
+      const index = Number(match[1]);
+
+      const sampleNumber = Math.floor(index / 2) + 1;
+      const type = index % 2 === 0 ? "input" : "output";
+
+      if (!sampleMap.has(sampleNumber)) {
+        sampleMap.set(sampleNumber, {
+          input: "",
+          output: ""
+        });
+      }
+
+      sampleMap.get(sampleNumber)[type] =
+        normalizeText(pre.textContent || "");
+    }
+
+    return [...sampleMap.entries()]
+      .sort((a, b) => a[0] - b[0])
+      .map(([_, sample]) => sample)
+      .filter(sample => sample.input || sample.output);
+  }
+  function getSamples() {
+    if (document.querySelector("#task-statement")) {
+      return getAtCoderSamples();
+    }
+
+    return getCodeforcesSamples();
   }
 
   async function saveSamplesNow() {
@@ -129,6 +337,14 @@
 
     if (!samples.length) {
       setStatus("No samples found", false);
+      console.warn(
+        "[Sample Copier] No samples found. Page:",
+        location.href,
+        "Tables:",
+        document.querySelectorAll("table").length,
+        "sample-test:",
+        document.querySelectorAll(".sample-test").length
+      );
       return;
     }
 
@@ -144,9 +360,12 @@
     if (state.badge) {
       state.badge.textContent = `Samples: ${samples.length}`;
     }
+
     if (state.button) {
       state.button.disabled = samples.length === 0;
-      state.button.textContent = samples.length === 0 ? "No samples found" : "Save samples";
+      state.button.textContent = samples.length === 0
+        ? "No samples found"
+        : "Save samples";
     }
   }
 
@@ -160,7 +379,7 @@
   }
 
   function ensureUI() {
-    if (state.panel) return;
+    if (state.panel || !document.body) return;
 
     const panel = document.createElement("div");
     panel.style.cssText = [
@@ -232,15 +451,16 @@
     document.addEventListener(
       "keydown",
       async (e) => {
-        if (e.repeat) return;
-        if (!matchesHotkey(e)) return;
+        if (e.repeat || !matchesHotkey(e)) return;
 
         const target = e.target;
         if (
           target &&
-          (target.tagName === "INPUT" ||
+          (
+            target.tagName === "INPUT" ||
             target.tagName === "TEXTAREA" ||
-            target.isContentEditable)
+            target.isContentEditable
+          )
         ) {
           return;
         }
